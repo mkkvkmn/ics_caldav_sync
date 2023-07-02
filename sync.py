@@ -7,8 +7,12 @@ from typing import Set
 import arrow
 import caldav
 import ics
-from ics.icalendar import Event
 import requests
+from ics.icalendar import Event
+from dateutil.rrule import rrulestr
+from dateutil.parser import parse
+from dateutil.tz import tzutc
+
 
 
 class ICSToCalDAV:
@@ -19,7 +23,7 @@ class ICSToCalDAV:
     Look no further.
 
     Arguments:
-    * remote_url (str): ICS file URL.
+    * remote_urls (list): ICS file URLs.
     * local_url (str): CalDAV URL.
     * local_calendar_name (str): The name of your CalDAV calendar.
     * local_username (str): CalDAV username.
@@ -31,7 +35,7 @@ class ICSToCalDAV:
     def __init__(
         self,
         *,
-        remote_url: str,
+        remote_urls: list,
         local_url: str,
         local_calendar_name: str,
         local_username: str,
@@ -47,12 +51,18 @@ class ICSToCalDAV:
         self.local_calendar = self.local_client.principal().calendar(
             local_calendar_name
         )
-        self.remote_calendar = ics.Calendar(
-            requests.get(
-                remote_url,
-                auth=(remote_username.encode(), remote_password.encode()),
-            ).text
-        )
+
+        self.remote_calendars = {}
+        for url, id in remote_urls:
+            self.remote_calendars[url] = {
+                "calendar": ics.Calendar(
+                    requests.get(
+                        url,
+                        auth=(remote_username.encode(), remote_password.encode()),
+                    ).text
+                ),
+                "id": id
+            }
 
     def _get_local_events_ids(self) -> Set[int]:
         """
@@ -72,14 +82,64 @@ class ICSToCalDAV:
         """
         Since CalDAV expects a VEVENT in a VCALENDAR,
         we need to wrap each event pulled from a single ICS
-        into its own calendar.
+        into its own calendar. Also added VTIMEZONE.
         """
-        return f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Chihiro Software Ltd//Calendar sync//EN
-{vevent}
-END:VCALENDAR
-"""
+        vtimezone = """
+            BEGIN:VTIMEZONE
+            TZID:Europe/Helsinki
+            BEGIN:DAYLIGHT
+            TZOFFSETFROM:+0200
+            RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU
+            DTSTART:19810329T030000
+            TZNAME:EEST
+            TZOFFSETTO:+0300
+            END:DAYLIGHT
+            BEGIN:STANDARD
+            TZOFFSETFROM:+0300
+            RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU
+            DTSTART:19811025T040000
+            TZNAME:EET
+            TZOFFSETTO:+0200
+            END:STANDARD
+            END:VTIMEZONE
+        """
+        result = f"""
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Chihiro Software Ltd//Calendar sync//EN
+            {vtimezone}
+            {vevent}
+            END:VCALENDAR
+        """
+        return "\n".join(line.lstrip() for line in result.split("\n"))
+
+
+    @staticmethod
+    def get_event_end(vevent):
+        """
+        Event end date might be earlier than the until date, 
+        the actual end date of recurring event. Find latest.
+        """
+        rrule_str = None
+        until_date = None
+
+        # find RRULE
+        event_str = str(vevent)
+        for line in event_str.splitlines():
+            if line.startswith('RRULE:'):
+                rrule_str = line.split("RRULE:")[1]
+
+        # find until date
+        if rrule_str:
+            rrule = rrulestr(rrule_str, dtstart=vevent.begin.datetime)
+            until_date = rrule._until
+
+        # get actual end date
+        max_date = vevent.end if until_date is None else max(vevent.end, until_date)
+        # print('max_date',max_date)
+
+        return max_date
+
 
     def synchronise(self):
         print('.synchronise')
@@ -89,84 +149,58 @@ END:VCALENDAR
         2) Saves them into the local calendar,
         3) Removes local events which are not in the remote any more.
         """
-        
-        print(f'found total {len(self.remote_calendar.events)} events')
-        current_time = arrow.utcnow()
-        future_events = []
-        past_events = []
+        for url, remote_calendar_info in self.remote_calendars.items():
+            remote_calendar = remote_calendar_info["calendar"]
+            id = remote_calendar_info["id"]
+            for remote_event in remote_calendar.events:
 
-        # https://icspy.readthedocs.io/en/stable/api.html#event
-        for event in self.remote_calendar.events:
-            if current_time > event.end:
-                past_events.append(event)
-            else:
-                future_events.append(event)
+                if remote_event.name != 'Arvova Dailya':
+                    
+                    max_date = self.get_event_end(remote_event)
 
-        # sort
-        future_events = sorted(future_events, key=lambda event: event.begin)
-        past_events = sorted(past_events, key=lambda event: event.begin)
-        
-        print(f'past:{len(past_events)}, future:{len(future_events)}')
+                    if arrow.utcnow().to('Europe/Helsinki') <= max_date:
 
-        for remote_event in future_events:
-            # print()
-            # print()
+                        try:
+                            # prefix name with id
+                            remote_event.name = f"{id}:{remote_event.name}"
 
-            # print(remote_event)
+                            # create unique UID for recurring events
+                            new_uid = f"{id}_{remote_event.uid}" + '||' + str(remote_event.begin.timestamp())
 
-            # print()
-            # print()
-            try:
-                if arrow.utcnow() > remote_event.end:
-                    continue
-                
-                print(f".processing event: {remote_event.name} ({remote_event.begin})")
-                event_str = str(remote_event)
-                new_uid = remote_event.uid + '-' + str(remote_event.begin.timestamp)
-                event_str = re.sub(
-                    r"UID:[^\n]+",  # Matches "UID:" followed by any characters except newline
-                    f"UID:{new_uid}",  # The replacement string
-                    event_str  # The string to search
-                )
-                event_str = re.sub(r"RECURRENCE-ID.*\n", "", event_str) # replace recurrence line
+                            # force unique UID for recurring events, keep each event and don't replace based on original UID
+                            event_str = str(remote_event)
+                            event_str = re.sub(r"UID:[^\n]+",f"UID:{new_uid}",event_str) # replace uid, match "UID:" plus any chars but newline
+                            event_str = re.sub(r"RECURRENCE-ID.*\n", "", event_str) # replace recurrence line
 
-                success = False
-                attempts = 0
-                while not success and attempts < 5:
-                    try:
-                        self.local_calendar.save_event(self._wrap(event_str))
-                        print("+", end="")
-                        sys.stdout.flush()
-                        success = True
-                    except Exception as e:
-                        attempts += 1
-                        print(f"Failed to save event {remote_event.uid} (attempt {attempts}): {e}")
-                        time.sleep(5)  # wait for 5 seconds before trying again
-            except Exception as e:
-                print(f"Failed to process event {remote_event.uid}: {e}")
-                continue
-        print()
+                            # use my timezone
+                            event_str = re.sub(r"DTSTART:[^\n]+", f"DTSTART;TZID=Europe/Helsinki:{remote_event.begin.strftime('%Y%m%dT%H%M%S')}", event_str)
+                            event_str = re.sub(r"DTEND:[^\n]+", f"DTEND;TZID=Europe/Helsinki:{remote_event.end.strftime('%Y%m%dT%H%M%S')}", event_str)
+                            event_str = re.sub(r"TZID=FLE Standard Time", f"TZID=Europe/Helsinki", event_str)
 
-        remote_events_ids = set(e.uid for e in self.remote_calendar.events)
-        # events_to_delete = self._get_local_events_ids() - remote_events_ids
-        for local_event_id in self._get_local_events_ids():
-            original_uid = local_event_id.split('-')[0]  # assuming the uid format is uid-starttime
-            if original_uid not in remote_events_ids:
+                            # check the event
+                            # print(self._wrap(event_str))
+
+                            self.local_calendar.save_event(self._wrap(event_str))
+                            print(f"+{remote_event.name} ({remote_event.begin})\n", end="")
+                            sys.stdout.flush()
+                                
+                        except Exception as e:
+                            print(f"Failed to process event {remote_event.uid}: {e}")
+                            continue
+
+            remote_events_ids = set(new_uid for e in remote_calendar.events)
+            local_events_ids = set(local_event_id.split('||')[0] for local_event_id in self._get_local_events_ids())
+            events_to_delete = local_events_ids - remote_events_ids
+
+            for local_event_id in events_to_delete:
                 self.local_client.delete(
                     f"{self.local_calendar.url}{local_event_id}.ics"
                 )
-                print("-", end="")
+                print(f"-{local_event_id}\n", end="")
                 sys.stdout.flush()
-        print()
+            print()
 
-        # for local_event_id in events_to_delete:
-        #     self.local_client.delete(
-        #         f"{self.local_calendar.url}{local_event_id}.ics"
-        #     )
-        #     print("-", end="")
-        #     sys.stdout.flush()
-
-
+       
 def getenv_or_raise(var):
     if (value := os.getenv(var)) is None:
         raise Exception(f"Environment variable {var} is unset")
@@ -175,14 +209,16 @@ def getenv_or_raise(var):
 
 if __name__ == "__main__":
     print('.set up env')
+    remote_url_strings = getenv_or_raise("REMOTE_URLS").split()
+    remote_urls = [tuple(s.split(",")) for s in remote_url_strings]
     settings = {
-        "remote_url": getenv_or_raise("REMOTE_URL"),
+        "remote_urls": remote_urls,
         "local_url": getenv_or_raise("LOCAL_URL"),
         "local_calendar_name": getenv_or_raise("LOCAL_CALENDAR_NAME"),
         "local_username": getenv_or_raise("LOCAL_USERNAME"),
         "local_password": getenv_or_raise("LOCAL_PASSWORD"),
         "remote_username": os.getenv("REMOTE_USERNAME", ""),
-        "remote_password": os.getenv("REMOTE_PASWORD", ""),
+        "remote_password": os.getenv("REMOTE_PASSWORD", ""),
     }
 
     sync_every = os.getenv("SYNC_EVERY", None)

@@ -124,7 +124,7 @@ class ICSToCalDAV:
         until_date = None
 
         # find RRULE
-        event_str = str(vevent)
+        event_str = vevent.serialize()
         for line in event_str.splitlines():
             if line.startswith('RRULE:'):
                 rrule_str = line.split("RRULE:")[1]
@@ -142,64 +142,74 @@ class ICSToCalDAV:
 
 
     def synchronise(self):
-        print('.synchronise')
         """
         The main function which:
         1) Pulls all the events from the remote calendar,
         2) Saves them into the local calendar,
         3) Removes local events which are not in the remote any more.
         """
-        for url, remote_calendar_info in self.remote_calendars.items():
+        
+        print(f".synchronise started at {arrow.utcnow().to('Europe/Helsinki')}")
+        remote_events_ids = set()
+
+        for idx, (url, remote_calendar_info) in enumerate(self.remote_calendars.items()):
+
             remote_calendar = remote_calendar_info["calendar"]
             id = remote_calendar_info["id"]
+            print() if idx > 0 else None
+            print(f'..processing calendar {id}: ', end="")
+
             for remote_event in remote_calendar.events:
 
-                if remote_event.name != 'Arvova Dailya':
-                    
-                    max_date = self.get_event_end(remote_event)
+                max_date = self.get_event_end(remote_event)
 
-                    if arrow.utcnow().to('Europe/Helsinki') <= max_date:
+                if arrow.utcnow().to('Europe/Helsinki') <= max_date:
 
-                        try:
-                            # prefix name with id
-                            remote_event.name = f"{id}:{remote_event.name}"
+                    try:
+                        # prefix name with id
+                        remote_event.name = f"{id}:{remote_event.name}"
 
-                            # create unique UID for recurring events
-                            new_uid = f"{id}_{remote_event.uid}" + '||' + str(remote_event.begin.timestamp())
+                        # create unique UID for recurring events
+                        new_uid = f"{id}_{remote_event.uid}" + '||' + str(remote_event.begin.timestamp())
 
-                            # force unique UID for recurring events, keep each event and don't replace based on original UID
-                            event_str = str(remote_event)
-                            event_str = re.sub(r"UID:[^\n]+",f"UID:{new_uid}",event_str) # replace uid, match "UID:" plus any chars but newline
-                            event_str = re.sub(r"RECURRENCE-ID.*\n", "", event_str) # replace recurrence line
+                        # force unique UID for recurring events, keep each event and don't replace based on original UID
+                        event_str = remote_event.serialize()
+                        event_str = re.sub(r"UID:[^\n]+",f"UID:{new_uid}",event_str) # replace uid, match "UID:" plus any chars but newline
+                        event_str = re.sub(r"RECURRENCE-ID.*\n", "", event_str) # replace recurrence line
 
-                            # use my timezone
-                            event_str = re.sub(r"DTSTART:[^\n]+", f"DTSTART;TZID=Europe/Helsinki:{remote_event.begin.strftime('%Y%m%dT%H%M%S')}", event_str)
-                            event_str = re.sub(r"DTEND:[^\n]+", f"DTEND;TZID=Europe/Helsinki:{remote_event.end.strftime('%Y%m%dT%H%M%S')}", event_str)
-                            event_str = re.sub(r"TZID=FLE Standard Time", f"TZID=Europe/Helsinki", event_str)
+                        # use my timezone
+                        event_str = re.sub(r"DTSTART:[^\n]+", f"DTSTART;TZID=Europe/Helsinki:{remote_event.begin.strftime('%Y%m%dT%H%M%S')}", event_str)
+                        event_str = re.sub(r"DTEND:[^\n]+", f"DTEND;TZID=Europe/Helsinki:{remote_event.end.strftime('%Y%m%dT%H%M%S')}", event_str)
+                        event_str = re.sub(r"TZID=FLE Standard Time", f"TZID=Europe/Helsinki", event_str)
 
-                            # check the event
-                            # print(self._wrap(event_str))
+                        # add remote event to the set
+                        remote_events_ids.add(new_uid)
 
-                            self.local_calendar.save_event(self._wrap(event_str))
-                            print(f"+{remote_event.name} ({remote_event.begin})\n", end="")
-                            sys.stdout.flush()
-                                
-                        except Exception as e:
-                            print(f"Failed to process event {remote_event.uid}: {e}")
-                            continue
+                        # check the event
+                        # print(self._wrap(event_str))
 
-            remote_events_ids = set(new_uid for e in remote_calendar.events)
-            local_events_ids = set(local_event_id.split('||')[0] for local_event_id in self._get_local_events_ids())
-            events_to_delete = local_events_ids - remote_events_ids
+                        self.local_calendar.save_event(self._wrap(event_str))
+                        # print(f"+{remote_event.name} ({remote_event.begin})\n", end="")
+                        print("+", end="")
+                        sys.stdout.flush()
+                            
+                    except Exception as e:
+                        print(f"Failed to process event {remote_event.uid}: {e}")
+                        continue
+        
+        # delete events not in remote calendar
+        local_events_ids = set(self._get_local_events_ids())
+        events_to_delete = local_events_ids - remote_events_ids
+        print("\n..deleting events: ", end="") if len(events_to_delete) > 0 else None
 
-            for local_event_id in events_to_delete:
-                self.local_client.delete(
-                    f"{self.local_calendar.url}{local_event_id}.ics"
-                )
-                # print(f"-{local_event_id}\n", end="")
-                print(f"-", end="")
-                sys.stdout.flush()
-            print()
+        for local_event_id in events_to_delete:
+            self.local_client.delete(
+                f"{self.local_calendar.url}{local_event_id}.ics"
+            )
+            # print(f"-{local_event_id}\n", end="")
+            print(f"-", end="")
+            sys.stdout.flush()
+        print()
 
        
 def getenv_or_raise(var):
@@ -209,7 +219,6 @@ def getenv_or_raise(var):
 
 
 if __name__ == "__main__":
-    print('.set up env')
     remote_url_strings = getenv_or_raise("REMOTE_URLS").split()
     remote_urls = [tuple(s.split(",")) for s in remote_url_strings]
     settings = {
@@ -225,13 +234,15 @@ if __name__ == "__main__":
     sync_every = os.getenv("SYNC_EVERY", None)
     if sync_every is not None:
         sync_every = "in " + sync_every
-        print(f'.sync every {sync_every}')
+        print(f'.sync {sync_every}')
         try:
             arrow.utcnow().dehumanize(sync_every)
         except ValueError as ve:
             raise ValueError(
                 "SYNC_EVERY value is invalid. Try something like '2 minutes' or '1 hours'"
             ) from ve
+    else:
+        print('.run once')
 
     while True:
         if sync_every is None:
@@ -245,6 +256,7 @@ if __name__ == "__main__":
             break
         else:
             seconds_to_next = (next_run - arrow.utcnow()).total_seconds()
-            print(f'.next sync in {seconds_to_next}s')
+            next_run_time = next_run.to('Europe/Helsinki')
+            print(f'.next sync at {next_run_time} (in {seconds_to_next}s)')
             if seconds_to_next > 0:
                 time.sleep(seconds_to_next)

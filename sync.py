@@ -196,7 +196,8 @@ class ICSToCalDAV:
                 self.local_client.delete(
                     f"{self.local_calendar.url}{local_event_id}.ics"
                 )
-                print(f"-{local_event_id}\n", end="")
+                # print(f"-{local_event_id}\n", end="")
+                print(f"-", end="")
                 sys.stdout.flush()
             print()
 
@@ -224,12 +225,12 @@ if __name__ == "__main__":
     sync_every = os.getenv("SYNC_EVERY", None)
     if sync_every is not None:
         sync_every = "in " + sync_every
-        print(f'.sync every{sync_every}')
+        print(f'.sync every {sync_every}')
         try:
             arrow.utcnow().dehumanize(sync_every)
         except ValueError as ve:
             raise ValueError(
-                "SYNC_EVERY value is invalid. Try something like '2 minutes' or '1 hour'"
+                "SYNC_EVERY value is invalid. Try something like '2 minutes' or '1 hours'"
             ) from ve
 
     while True:

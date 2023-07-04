@@ -245,5 +245,6 @@ if __name__ == "__main__":
             break
         else:
             seconds_to_next = (next_run - arrow.utcnow()).total_seconds()
+            print(f'.next sync in {seconds_to_next}s')
             if seconds_to_next > 0:
                 time.sleep(seconds_to_next)

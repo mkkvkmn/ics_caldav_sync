@@ -19,4 +19,4 @@ Set the settings as environment variables:
 * SYNC_EVERY (str): How often should the synchronisation occur? For example: 2 minutes, 1 hour. Synchronise once if empty.
 
 ## Rationale
-Couldn't think of a better way to sync multiple o365 calendars with my caldav server.
+Couldn't think of a better way to sync multiple shared calendars with my caldav server.
